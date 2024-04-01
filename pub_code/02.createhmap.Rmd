@@ -1,0 +1,225 @@
+---
+title: "Pseudobulk analysis of crypts"
+author: "Ricardo Ramirez"
+date: "2022-12-15"
+output: 
+  html_document:
+      code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, message=FALSE}
+library(tidyverse)
+library(scuttle)
+library(edgeR)
+library(Seurat)
+library(knitr)
+library(rmarkdown)
+library(ComplexHeatmap)
+```
+
+## Experimental design
+
+We have been provided with groups of spots that belong to a certain crypt within a visium slide (n = 2). Within each slide there are two types of crypts (healthy and disease) and each slide represents a different condition.
+
+The objective is to:
+
+1) Identify the differentially expressed genes between types of crypts
+2) Assess if there is an interaction with the different conditions (not detached from technical since there are no replicates of diets)
+
+### Extract count matrix and meta data of original data
+
+```{r}
+d6_data <- readRDS("./R_objects/se.helminth.d6")
+# Count data
+DefaultAssay(d6_data) <- "RNA"
+GEX_mat <- Seurat::GetAssayData(d6_data, assay = "RNA", slot ="counts")
+GEX_mat <- GEX_mat[grepl("refdata-gex-mm10",rownames(GEX_mat)),]
+rownames(GEX_mat) <- gsub("refdata-gex-mm10----------", "", rownames(GEX_mat))
+
+# Meta data
+meta_data <- d6_data@meta.data %>%
+  rownames_to_column("raw_spot_id") %>%
+  dplyr::mutate(spot_id = strsplit(raw_spot_id,
+                                   "_") %>%
+                  map_chr(., ~.x[[1]])) %>%
+  dplyr::select(raw_spot_id, spot_id, diet, day, section_id)
+```
+
+### Spots of each crypt were provided
+
+```{r, message=FALSE, warning= FALSE}
+list_spots <- map(list.files("./ann/",full.names = T) %>% set_names,
+    read_csv) %>%
+  enframe() %>%
+  unnest()
+
+colnames(list_spots) <- c("file","spot_id", "ctrl_crypt", "granuloma_crypt")
+
+list_spots <- list_spots %>% 
+  dplyr::filter(!is.na(ctrl_crypt) | !is.na(granuloma_crypt)) %>%
+  pivot_longer(-c(file,spot_id),names_to = "crypt_type", values_to = "id") %>%
+  na.omit() %>%
+  dplyr::mutate(diet = ifelse(grepl("STD", file), "STD", "GW")) %>%
+  dplyr::select(-file)
+
+meta_data <- meta_data %>%
+  left_join(list_spots, by = c("spot_id", "diet")) %>%
+  na.omit() %>%
+  arrange(crypt_type, id) %>%
+  dplyr::mutate(id = paste0(diet, "_", id))
+
+# Check for duplicated spots during manual annotation
+duplicated_spots <- meta_data$raw_spot_id[duplicated(meta_data$raw_spot_id)]
+
+meta_data <- meta_data %>%
+  dplyr::filter(!raw_spot_id %in% duplicated_spots)
+
+coldata <- meta_data %>%
+  dplyr::select(id, diet, crypt_type) %>%
+  unique()
+```
+
+### Create pseudobulk profiles
+
+```{r}
+GEX_mat <- GEX_mat[,meta_data$raw_spot_id]
+
+pb_GEX_mat <- scuttle::sumCountsAcrossCells(x = GEX_mat,
+                                            ids  = meta_data %>% 
+                                              dplyr::select(raw_spot_id, id) %>% 
+                                              column_to_rownames("raw_spot_id") %>% 
+                                              DataFrame())
+
+pb_GEX_mat@colData <- pb_GEX_mat@colData %>%
+  as.data.frame() %>%
+  left_join(coldata, by = "id") %>%
+  DataFrame()
+
+assay(pb_GEX_mat, "counts") <- assay(pb_GEX_mat, "sum")
+```
+
+### Filter genes based on expression
+
+Here we are strict in the sense that we have 6 pseudobulk profiles per diet and granuloma type, hence we will keep genes that have at least 1 read in 6 samples of a given group
+
+```{r}
+keep <- edgeR::filterByExpr(pb_GEX_mat, 
+                            min.prop = 1, 
+                            group = paste0(pb_GEX_mat@colData$diet,
+                                           pb_GEX_mat@colData$crypt_type) %>%
+                              as.factor(), 
+                            min.count = 1, 
+                            min.total.count = 6)
+
+pb_GEX_mat <- pb_GEX_mat[keep,]
+print("dimension of matrix genes/samples")
+dim(pb_GEX_mat)
+```
+
+Do tmm normalization for regular exploratory analysis
+
+```{r}
+scale_factor = 100000
+all_nf <- edgeR::calcNormFactors(pb_GEX_mat, method = "TMM")
+sfs <- all_nf$samples$lib.size * all_nf$samples$norm.factors
+pb <- sweep(assay(pb_GEX_mat, "counts"), MARGIN = 2, sfs, FUN = "/")
+assay(pb_GEX_mat, "logcounts") <- log1p(pb * scale_factor)
+```
+
+# Using the results from DEA
+
+```{r}
+fit <- readRDS("./results/edgeR_fit.rds")
+my_contrasts <- readRDS("./results/edgeR_contrasts.rds")
+```
+
+### Effect of granuloma crypt
+
+What are the up or downregulated genes in the granuloma vs the ctrl crypt? This is done across slides
+
+```{r}
+granuloma_degs <- glmQLFTest(fit, contrast=my_contrasts[,"granulomavcrpt"])
+
+granuloma_degs <- topTags(granuloma_degs, n = Inf) %>%
+    as.data.frame() %>%
+    rownames_to_column("gene") %>%
+    dplyr::mutate(rank_stat = abs(logFC) * -log10(FDR))
+
+g_degs_flexible <- granuloma_degs %>%
+  dplyr::filter(FDR <= 0.1) %>%
+  arrange(desc(rank_stat)) %>%
+  pull(gene)
+```
+
+### Effect of diet in all groups
+
+What are the up or downregulated genes in the GW vs the STD diet?
+
+```{r}
+diet_degs <- glmQLFTest(fit, contrast=my_contrasts[,"diet_effect"])
+
+all_diet_degs <- topTags(diet_degs, n = Inf) %>%
+    as.data.frame() %>%
+    rownames_to_column("gene") %>%
+  dplyr::filter(FDR <= 0.1)
+
+diet_degs <- topTags(diet_degs, n = Inf) %>%
+    as.data.frame() %>%
+    rownames_to_column("gene") %>%
+  dplyr::filter(FDR <= 0.1) %>%
+  dplyr::mutate(rank_stat = abs(logFC) * -log10(FDR)) %>%
+  arrange(desc(rank_stat)) %>%
+  dplyr::slice(1:10) %>%
+  pull(gene)
+```
+
+# Now effect of crypt in different diets
+
+```{r}
+std_diet_granuloma <- glmQLFTest(fit, contrast=my_contrasts[,"granuloma_effect_std"])
+
+std_diet_granuloma <- topTags(std_diet_granuloma, n = Inf) %>%
+    as.data.frame() %>%
+    rownames_to_column("gene") %>%
+    dplyr::filter(FDR <= 0.1) %>%
+  dplyr::mutate(rank_stat = abs(logFC) * -log10(FDR)) %>%
+  arrange(desc(rank_stat)) %>%
+  dplyr::slice(1:10) %>%
+  pull(gene)
+```
+
+```{r}
+gw_diet_granuloma <- glmQLFTest(fit, contrast=my_contrasts[,"granuloma_effect_gw"])
+
+gw_diet_granuloma <- topTags(gw_diet_granuloma, n = Inf) %>%
+    as.data.frame() %>%
+    rownames_to_column("gene") %>%
+    dplyr::filter(FDR <= 0.1) %>%
+  dplyr::mutate(rank_stat = abs(logFC) * -log10(FDR)) %>%
+  arrange(desc(rank_stat)) %>%
+  dplyr::slice(1:10) %>%
+  pull(gene)
+```
+
+Final heatmap
+
+```{r}
+counts <- pb_GEX_mat %>% assay(., "logcounts") %>% t() %>% scale() %>% t()
+
+ha <- HeatmapAnnotation(diet = colData(pb_GEX_mat)[,"diet"],
+                        crypt_type = colData(pb_GEX_mat)[,"crypt_type"],
+                        col = list(crypt_type = c("granuloma_crypt" = "yellow", "ctrl_crypt" = "pink"),
+                                   diet = c("GW" = "darkgreen", "STD" = "orange")))
+
+
+sign_genes <- unique(c(g_degs_flexible, diet_degs, gw_diet_granuloma, std_diet_granuloma))
+
+pdf("./pub_results/hmap_edger_sign0.1.pdf", height = 6, width = 6)
+
+ComplexHeatmap::Heatmap(counts[sign_genes,], name = "Expression", top_annotation = ha)
+
+dev.off()
+```
+
